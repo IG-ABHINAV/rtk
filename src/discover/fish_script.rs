@@ -293,9 +293,9 @@ fn classify_tokens(tokens: &[Token<'_>]) -> bool {
             // command. The lexer emits an unquoted backtick as its own
             // shellism, quoted ones stay inside their Arg.
             TokenKind::Shellism if token.value == "`" => return false,
-            // Heredocs (`<<`, `<<-`, `<<<` all tokenize with a `<<` prefix) do not
-            // exist in fish — the script must be POSIX or malformed.
-            TokenKind::Redirect if token.value.starts_with("<<") => return false,
+            // Heredocs and herestrings do not exist in fish — the script must be
+            // POSIX or malformed.
+            TokenKind::Redirect if lexer::is_heredoc_operator(token.value) => return false,
             TokenKind::Arg => {
                 // `[[ … ]]` is bash/zsh-only wherever it appears.
                 if token.value == "[[" {
@@ -395,6 +395,9 @@ mod tests {
     fn test_heredoc_vetoes_fish() {
         assert!(!is_unambiguous_fish(
             "if test -d src\ncat <<EOF\nx\nEOF\nend"
+        ));
+        assert!(!is_unambiguous_fish(
+            "if test -d src\ncat 0<<EOF\nx\nEOF\nend"
         ));
     }
 

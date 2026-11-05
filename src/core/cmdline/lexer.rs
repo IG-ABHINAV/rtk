@@ -438,6 +438,28 @@ fn has_source_syntax(text: &str) -> bool {
     text.contains('#') || text.contains("\\\n")
 }
 
+/// A line read once for its continuations, as the hook reads it: joined, or as
+/// written when it is too complex to join, which `joined` tells apart.
+pub(crate) struct JoinedLine<'a> {
+    pub(crate) text: Cow<'a, str>,
+    pub(crate) joined: bool,
+}
+
+impl<'a> JoinedLine<'a> {
+    pub(crate) fn of(text: &'a str) -> Self {
+        match join_continuations(text) {
+            Ok(joined) => Self {
+                text: joined,
+                joined: true,
+            },
+            Err(_) => Self {
+                text: Cow::Borrowed(text),
+                joined: false,
+            },
+        }
+    }
+}
+
 /// What to read of a [`join_continuations`] answer: the line, or every reading of one
 /// too complex to read.
 pub(crate) fn every_reading<'a>(
@@ -952,20 +974,24 @@ pub(crate) fn redirect_takes_operand(value: &str) -> bool {
     tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit() || c == '-')
 }
 
+/// Whether the redirect token `value` opens a heredoc or a herestring. The operator
+/// arrives as `<<` with any fd digits folded in front (`3<<`); the `-` of `<<-` stays
+/// in the next word, and a herestring `<<<` arrives as `<<` then `<`.
+pub(crate) fn is_heredoc_operator(value: &str) -> bool {
+    value
+        .trim_start_matches(|ch: char| ch.is_ascii_digit())
+        .starts_with("<<")
+}
+
 // A redirect that takes an operand names a file unless that operand is
 // `/dev/null`; a bare `>&` before a word is `>word 2>&1` — a file target too.
 // A heredoc or herestring also returns true, whatever its delimiter: its body
 // is inline data that no caller can attest.
 pub(crate) fn redirect_has_file_target(tokens: &[Token<'_>], i: usize) -> bool {
     let value = tokens[i].value;
-    // A heredoc operator arrives as `<<` with any fd digits folded in front
-    // (`3<<`); the `-` of `<<-` stays in the next word, and a herestring `<<<`
-    // arrives as `<<` then `<`. Its operand is a delimiter, so a delimiter
-    // spelled `/dev/null` must not reach the exemption below.
-    if value
-        .trim_start_matches(|ch: char| ch.is_ascii_digit())
-        .starts_with("<<")
-    {
+    // Its operand is a delimiter, so a delimiter spelled `/dev/null` must not
+    // reach the exemption below.
+    if is_heredoc_operator(value) {
         return true;
     }
     if !redirect_takes_operand(value) {

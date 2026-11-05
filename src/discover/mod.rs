@@ -13,12 +13,15 @@ use std::collections::HashMap;
 
 use provider::{ClaudeProvider, ExtractedCommand, SessionProvider};
 use registry::{
-    Classification, ExcludePattern, category_avg_tokens, classify_command_at,
+    ChainPart, Classification, ExcludePattern, category_avg_tokens, classify_command_at,
     split_command_chain_parts, strip_disabled_prefix_for_analytics,
 };
 use report::{DiscoverReport, SupportedEntry, UnsupportedEntry};
 
-use crate::core::cmdline::lexer::{self, CommandStart, join_continuations, tokenize, words};
+use crate::core::cmdline::bash_grammar::{Position, Reserved, reserved_word};
+use crate::core::cmdline::lexer::{
+    self, CommandStart, JoinedLine, SubstitutionDepth, TokenKind, tokenize, words,
+};
 use crate::core::cmdline::rtk::rtk_invocation;
 use crate::core::tracking::{HookDecisionRecord, Tracker};
 use crate::core::user_dirs;
@@ -314,9 +317,9 @@ struct SupportedBucket {
     /// `total_output_tokens / total_raw_output_tokens` — a weighted average across
     /// all sub-commands, regardless of which sub-command was seen first.
     total_raw_output_tokens: usize,
-    /// How many of `count` were sized by the category average because the line
-    /// they came from measured somebody else's output. A command that feeds a
-    /// pipe is never the last of its line, so it is always one of these.
+    /// How many of `count` were estimated from category averages: sized by their own,
+    /// because the call had no measured output, or given a share of a number other
+    /// commands wrote to as well.
     estimated_occurrences: usize,
     // For display: the most common raw command
     command_counts: HashMap<String, usize>,
@@ -356,19 +359,310 @@ fn disposition(bypassed: bool, reached: bool, covered: bool, consumes_a_pipe: bo
     if bypassed || reached {
         return Disposition::Missed;
     }
-    // A command reading another's output wrote what actually came back, and
-    // `output_len` already measures that. Counting it would claim a saving on
-    // the one line `tail` printed on top of everything `cargo` wrote.
-    //
+    // A consumer the rewriter does not take (`tail` in `cargo test | tail -1`,
+    // `grep -f patterns.txt` after any producer) stays raw because rewriting it
+    // would change what the pipeline prints: no change to the command reaches
+    // that saving.
+    if consumes_a_pipe {
+        return Disposition::Dropped;
+    }
     // Anything else RTK has a rule for is an opportunity, whatever kept the
     // rewriter off it — feeding a pipe whose consumer throws the output away,
     // or being written in a form the rewriter does not match, like an absolute
     // path (#1053). Dropping those hides real savings and hides the
     // disagreements between classification and rewriting that cause them.
-    if consumes_a_pipe {
-        return Disposition::Dropped;
-    }
     Disposition::Opportunity
+}
+
+/// The category average that sizes `command`, a command of `category`.
+fn average_tokens(category: &str, command: &str) -> usize {
+    let head = head_words(command);
+    category_avg_tokens(category, head.get(1).copied().unwrap_or(""))
+}
+
+/// After a pipe, `time` is the program `time`.
+fn command_start(consumes_a_pipe: bool) -> CommandStart {
+    if consumes_a_pipe {
+        CommandStart::PipeStage
+    } else {
+        CommandStart::Pipeline
+    }
+}
+
+/// Commands whose output is next to nothing beside what they run with. `source` and `set`
+/// usually print nothing (an activate script, `set -e`), though one can run a noisy script,
+/// whose output then goes to the commands around it. A wrong entry only moves a share
+/// between the commands of one call.
+const WRITES_NEXT_TO_NOTHING: &[&str] = &[
+    "cd", "echo", "printf", "pwd", "true", "false", "export", "set", "unset", "local", "read",
+    "declare", "let", "shift", "mkdir", "rmdir", "mv", "cp", "ln", "rm", "chmod", "chown", "touch",
+    "sleep", "wait", "kill", "source", ".", "which", "type", "test", "[", "exit", "return", ":",
+];
+
+fn writes_next_to_nothing(command: &str, start: CommandStart) -> bool {
+    first_command_word(command, start).is_none_or(|word| WRITES_NEXT_TO_NOTHING.contains(&word))
+}
+
+/// The first word of `part`, a command at `start`, that names a command: past a redirect's
+/// operand and the reserved words that lead to a command or close a compound (`then`, `do`,
+/// `!`, `}`; `time` only where a pipeline starts). `None` where no command runs: a comment,
+/// a bare assignment (the caller has taken the assignments in front off), a compound's last
+/// word alone, the header of a `for`, `select` or `case`, a `[[` test or a `((` expression.
+/// A command named by a substitution (`$(pwd)/run.sh`) has no word to read, and is never
+/// one of the quiet ones.
+fn first_command_word(part: &str, start: CommandStart) -> Option<&str> {
+    let mut takes_the_next = false;
+    let mut after_a_paren = false;
+    // The options of the reserved word just read (`time -p`).
+    let mut options: &[&str] = &[];
+    let mut substitution = SubstitutionDepth::default();
+    for token in tokenize(part).iter().filter(|token| !token.is_blank()) {
+        let backquote = token.kind == TokenKind::Shellism && token.value == "`";
+        if !takes_the_next && (backquote || substitution.absorbs(part, token)) {
+            return Some(part);
+        }
+        let opens = token.kind == TokenKind::Shellism && token.value == "(";
+        if opens && after_a_paren {
+            return None;
+        }
+        after_a_paren = opens;
+        match token.kind {
+            TokenKind::Redirect => takes_the_next = lexer::redirect_takes_operand(token.value),
+            TokenKind::Arg if takes_the_next => takes_the_next = false,
+            TokenKind::Arg if options.contains(&token.value) => {}
+            TokenKind::Arg => match reserved_word(token.value) {
+                Some(word) if word.word == Reserved::Time && start == CommandStart::PipeStage => {
+                    return Some(token.value);
+                }
+                Some(word) if word.next == Position::Word => return None,
+                Some(word) => options = word.options,
+                None => return Some(token.value),
+            },
+            _ => takes_the_next = false,
+        }
+    }
+    None
+}
+
+/// Whether `part` sends both its output and its errors somewhere other than back to the
+/// agent, as `cargo test > test.log 2>&1` does. The redirects count in order (`2>&1 > f`
+/// still sends the errors back), a substitution's own redirects do not, and a text that
+/// holds several commands sends nothing back only if none of them does.
+fn sends_nothing_back(part: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Target {
+        Back,
+        Elsewhere,
+    }
+    #[derive(Clone, Copy)]
+    enum Fds {
+        Out,
+        Err,
+        Both,
+        Other,
+    }
+    fn route(fds: Fds, target: Target, out: &mut Target, err: &mut Target) {
+        match fds {
+            Fds::Out => *out = target,
+            Fds::Err => *err = target,
+            Fds::Both => (*out, *err) = (target, target),
+            Fds::Other => {}
+        }
+    }
+    /// A redirect waiting for its operand: the streams it sends to a file, and those
+    /// it copies when the operand is an fd number (`>& 2`).
+    struct Pending {
+        file: Fds,
+        copy: Option<Fds>,
+    }
+    let tokens = tokenize(part);
+    let mut substitution = SubstitutionDepth::default();
+    let mut in_backquotes = false;
+    let (mut out, mut err) = (Target::Back, Target::Back);
+    let mut pending: Option<Pending> = None;
+    // Whether a command has started since the last separator, and whether one before
+    // it was checked: a separator with no command before it ends nothing.
+    let (mut in_a_command, mut checked_one) = (false, false);
+    // A newline ends a command here, so it is not one of the blanks skipped.
+    let words_and_ends = tokens
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Sep | TokenKind::Comment));
+    for token in words_and_ends {
+        // The token after an operand-taking redirect starts its operand, spelled with an
+        // expansion (`> ${LOG}`, `> $(mktemp)`) as well.
+        if let Some(redirect) = pending.take() {
+            // `> >(tee log)` writes to a process, which may well print it back.
+            if token.kind == TokenKind::Redirect {
+                route(redirect.file, Target::Back, &mut out, &mut err);
+                continue;
+            }
+            let is_fd = !token.value.is_empty() && token.value.bytes().all(|b| b.is_ascii_digit());
+            let expands = token.kind != TokenKind::Arg || token.value.contains('$');
+            let (fds, target) = match (token.kind, token.value, redirect.copy) {
+                (TokenKind::Arg, "1", Some(copy)) => (copy, out),
+                (TokenKind::Arg, "2", Some(copy)) => (copy, err),
+                (TokenKind::Arg, "-", Some(copy)) => (copy, Target::Elsewhere),
+                // An fd this walk does not follow, or one held in a variable (`>&$FD`),
+                // may hold a copy of either stream.
+                (_, _, Some(copy)) if is_fd || expands => (copy, Target::Back),
+                (TokenKind::Arg, "/dev/stdout" | "/dev/fd/1", _) => (redirect.file, out),
+                (TokenKind::Arg, "/dev/stderr" | "/dev/fd/2", _) => (redirect.file, err),
+                (TokenKind::Arg, "/dev/tty", _) => (redirect.file, Target::Back),
+                _ => (redirect.file, Target::Elsewhere),
+            };
+            route(fds, target, &mut out, &mut err);
+        }
+        if token.kind == TokenKind::Shellism && token.value == "`" {
+            in_backquotes = !in_backquotes;
+            in_a_command = true;
+            continue;
+        }
+        if in_backquotes || substitution.absorbs(part, token) || substitution.is_inside() {
+            in_a_command = true;
+            continue;
+        }
+        let ends_a_command = match token.kind {
+            TokenKind::Operator | TokenKind::Pipe(_) | TokenKind::Newline => true,
+            TokenKind::Shellism => token.value == "&",
+            _ => false,
+        };
+        if ends_a_command {
+            if in_a_command {
+                if out == Target::Back || err == Target::Back {
+                    return false;
+                }
+                (out, err) = (Target::Back, Target::Back);
+                (in_a_command, checked_one) = (false, true);
+            }
+            continue;
+        }
+        in_a_command = true;
+        if token.kind != TokenKind::Redirect {
+            continue;
+        }
+        let value = token.value;
+        let operator = value.trim_start_matches(|ch: char| ch.is_ascii_digit());
+        let fd = &value[..value.len() - operator.len()];
+        let named = match fd {
+            "" | "1" => Fds::Out,
+            "2" => Fds::Err,
+            _ => Fds::Other,
+        };
+        let fds = match fd {
+            _ if operator.starts_with("&>") => Fds::Both,
+            _ if !operator.starts_with('>') => continue,
+            "" if operator.ends_with('&') => Fds::Both,
+            _ => named,
+        };
+        if lexer::redirect_takes_operand(value) {
+            // `>&word` with no fd named is `&>word`, unless `word` is an fd number.
+            pending = Some(Pending {
+                file: fds,
+                copy: operator.ends_with('&').then_some(named),
+            });
+            continue;
+        }
+        let target = match operator.trim_start_matches(['>', '&']) {
+            "1" => out,
+            "2" => err,
+            "-" => Target::Elsewhere,
+            _ => Target::Back,
+        };
+        route(fds, target, &mut out, &mut err);
+    }
+    if in_a_command {
+        out == Target::Elsewhere && err == Target::Elsewhere
+    } else {
+        checked_one
+    }
+}
+
+/// One command of a call, read once for the output shares and for its row.
+struct PartReading<'a> {
+    /// The assignments in front of it, and the command after them.
+    env_prefix: &'a str,
+    command: &'a str,
+    /// Whether it reads the output of the command before it, which feeds a pipe.
+    consumes: bool,
+    /// What the part classifies as, as written.
+    class: Classification,
+}
+
+impl<'a> PartReading<'a> {
+    fn of(parts: &[ChainPart<'a>]) -> Vec<Self> {
+        parts
+            .iter()
+            .enumerate()
+            .map(|(index, part)| {
+                let (env_prefix, command) = strip_disabled_prefix_for_analytics(part.text);
+                let consumes = index > 0 && parts[index - 1].feeds_pipe;
+                Self {
+                    env_prefix,
+                    command,
+                    consumes,
+                    class: classify_command_at(part.text, command_start(consumes)),
+                }
+            })
+            .collect()
+    }
+
+    fn start(&self) -> CommandStart {
+        command_start(self.consumes)
+    }
+}
+
+/// What a command's row counts of its call's output, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Share {
+    /// What came back of it is known: the whole measurement, or nothing of one.
+    Known(usize),
+    /// Its part of a measurement other commands wrote to as well, or a nothing read
+    /// from its redirects alone.
+    Estimated(usize),
+    /// There is no measurement for it: its category average stands in.
+    Average,
+}
+
+/// What each part's row counts of a call's measured output.
+///
+/// Which command wrote what of one output cannot be told apart, so every command that may
+/// have written to it shares it, in proportion to its category average, and one alone takes
+/// it whole. Both stages of a pipeline are among them: what came back is the producer's
+/// output, as the consumer kept it. A command the report leaves out as writing next to
+/// nothing (`echo done`, `cd x`) takes none, and any other command with no row, such as
+/// `bash x.sh`, takes a share that no row shows. A command that sent both its streams
+/// elsewhere wrote none of it, measured or not.
+fn output_shares(parts: &[PartReading<'_>], output_len: Option<usize>) -> Vec<Share> {
+    let weights: Vec<Option<usize>> = parts
+        .iter()
+        .map(|part| match &part.class {
+            _ if sends_nothing_back(part.command) => Some(0),
+            Classification::Supported { category, .. } => {
+                Some(average_tokens(category, part.command))
+            }
+            _ if writes_next_to_nothing(part.command, part.start()) => None,
+            _ => Some(category_avg_tokens("", "")),
+        })
+        .collect();
+    let writers = weights
+        .iter()
+        .flatten()
+        .filter(|&&weight| weight > 0)
+        .count();
+    let total: usize = weights.iter().flatten().sum();
+    weights
+        .iter()
+        .map(|weight| match (*weight, output_len) {
+            (Some(0), Some(_)) => Share::Known(0),
+            // Read from its redirects alone, with no measurement to check it against.
+            (Some(0), None) => Share::Estimated(0),
+            (Some(_), Some(len)) if writers == 1 => Share::Known(len),
+            (Some(weight), Some(len)) => {
+                Share::Estimated((len as f64 * weight as f64 / total as f64) as usize)
+            }
+            _ => Share::Average,
+        })
+        .collect()
 }
 
 /// Everything one scan counts, kept apart from the session files and the
@@ -403,47 +697,27 @@ impl Tally {
     fn add(&mut self, ext_cmd: &ExtractedCommand, ctx: &CoverageContext) {
         // The line as the hook reads it, so a `\⏎` is no word of the report's. One too
         // complex to join stays as written.
-        let joined = join_continuations(&ext_cmd.command);
-        let command = joined.as_deref().unwrap_or(ext_cmd.command.as_str());
-        let parts = split_command_chain_parts(command);
+        let line = JoinedLine::of(&ext_cmd.command);
+        let command: &str = &line.text;
+        let parts = split_command_chain_parts(&line);
         // One answer per command, worked out once for the line: what the
         // rewriter does to one command depends on the ones around it, and a
         // report that counts a command the rewriter passes over promises a
         // saving the hook does not take.
         let reached = registry::stages_the_rewriter_reaches(
-            command,
+            &line,
             &ctx.exclude_patterns,
             &ctx.normalized_transparent_prefixes,
         );
-        for (index, chain_part) in parts.iter().enumerate() {
+        let readings = PartReading::of(&parts);
+        let shares = output_shares(&readings, ext_cmd.output_len);
+        for ((index, chain_part), reading) in parts.iter().enumerate().zip(readings) {
             let part = chain_part.text;
-            // A command reads another's output when the one before it feeds
-            // a pipe, and after that pipe `time` is the program `time`.
-            let consumes_a_pipe = index
-                .checked_sub(1)
-                .and_then(|prev| parts.get(prev))
-                .is_some_and(|prev| prev.feeds_pipe);
-            let start = if consumes_a_pipe {
-                CommandStart::PipeStage
-            } else {
-                CommandStart::Pipeline
-            };
-            // `output_len` measures what came back from the tool call, which
-            // is what the last command in the line wrote. An earlier one
-            // either fed a pipe, and its output was consumed rather than
-            // returned, or shares the number with its siblings — either way
-            // the per-category average is the honest estimate for it, and
-            // handing this number to every part would multiply the total by
-            // the number of parts.
-            let output_len = if index + 1 == parts.len() {
-                ext_cmd.output_len
-            } else {
-                None
-            };
+            let start = reading.start();
             self.total_commands += 1;
 
             // Detect RTK_DISABLED= bypass before classification
-            let (env_prefix, actual_cmd) = strip_disabled_prefix_for_analytics(part);
+            let (env_prefix, actual_cmd) = (reading.env_prefix, reading.command);
             let bypassed = prefix_contains_rtk_disabled(env_prefix);
             let unbypassed;
             let part = if bypassed {
@@ -474,7 +748,14 @@ impl Tally {
                 part
             };
 
-            match classify_command_at(part, start) {
+            // An unbypassed line has lost its `RTK_DISABLED=`, which classification
+            // reads past only in front (`sudo RTK_DISABLED=1 docker ps` is `sudo`).
+            let class = if bypassed {
+                classify_command_at(part, start)
+            } else {
+                reading.class
+            };
+            match class {
                 Classification::Supported {
                     rtk_equivalent,
                     category,
@@ -487,7 +768,7 @@ impl Tally {
                         bypassed,
                         reached.get(index).copied().unwrap_or(false),
                         coverage.is_covered(),
-                        consumes_a_pipe,
+                        reading.consumes,
                     ) {
                         Disposition::AlreadyRtk => {
                             self.already_rtk += 1;
@@ -515,20 +796,16 @@ impl Tally {
 
                     bucket.count += 1;
 
-                    if output_len.is_none() {
+                    let (output_tokens, estimated) = match shares[index] {
+                        Share::Known(len) => (len / 4, false),
+                        Share::Estimated(len) => (len / 4, true),
+                        Share::Average => (average_tokens(category, actual_cmd), true),
+                    };
+                    if estimated {
                         bucket.estimated_occurrences += 1;
                     }
 
                     let head = head_words(part);
-                    // Estimate tokens for this command
-                    let output_tokens = if let Some(len) = output_len {
-                        // Real: from tool_result content length
-                        len / 4
-                    } else {
-                        // Fallback: category average
-                        let subcmd = head.get(1).copied().unwrap_or("");
-                        category_avg_tokens(category, subcmd)
-                    };
 
                     let savings = (output_tokens as f64 * estimated_savings_pct / 100.0) as usize;
                     bucket.total_output_tokens += savings;
@@ -926,6 +1203,254 @@ mod tests {
         tally
     }
 
+    /// Tokens of 400 KB of output, as a row reads them.
+    const MEASURED: usize = 100_000;
+
+    fn row_of_a_call(command: &str, rule: &str) -> (usize, usize) {
+        let mut tally = Tally::default();
+        tally.add(&scanned(command, Some(4 * MEASURED)), &test_ctx(false));
+        [&tally.supported, &tally.opportunities]
+            .iter()
+            .find_map(|map| map.get(rule))
+            .map(|bucket| (bucket.estimated_occurrences, bucket.total_raw_output_tokens))
+            .unwrap_or_else(|| panic!("{command:?}: no {rule} row"))
+    }
+
+    /// A command alone takes the call's whole output, whatever the report ignores after it.
+    #[test]
+    fn test_a_calls_only_writer_takes_its_measured_output() {
+        for command in [
+            "cargo test",
+            "cargo test\necho done",
+            "cargo test; echo done",
+            "cargo test\ncd x",
+            "cargo test\n# done",
+            "cargo test; # done",
+            "cargo test\nprintf done",
+            "source .venv/bin/activate && cargo test",
+            "test -f Cargo.toml && cargo test",
+            "which cargo && cargo test",
+            "[[ -f Cargo.toml ]] && cargo test",
+            "(( n > 0 )) && cargo test",
+            "> out.log; cargo test",
+            ">&2 echo failed; cargo test",
+            "2>/dev/null cd x; cargo test",
+            "BASE=origin/main\ncargo test",
+            "X=1 cd x; cargo test",
+            "(cd sub) 2>/dev/null; cargo test",
+            // A reserved word leads to the command, or no command runs.
+            "if test -f Cargo.toml; then cd x; fi; cargo test",
+            "for f in a b; do echo $f; done && cargo test",
+            "while read line; do echo $line; done < list.txt; cargo test",
+            "case $x in a) cd a;; esac; cargo test",
+            "{ cd x; }; cargo test",
+            "((i++)) && cargo test",
+            // Redirects that are not its own, or that send the streams back.
+            "cargo test $( [ -f x ] >/dev/null 2>&1 && echo --release ); echo done",
+            "cargo test $(cat flags.txt >/dev/null 2>&1); echo done",
+            "cargo test `cat flags.txt >/dev/null 2>&1`; echo done",
+            "time echo x; cargo test",
+            "time -p sleep 5; cargo test",
+            // A copy through an fd this does not follow may come back.
+            "cargo test 3>&1 1>/dev/null 2>&3; echo done",
+            "cargo test 3>&2 >/dev/null 2>& 3; echo done",
+            "cargo test >/dev/stderr 2>/dev/stdout; echo done",
+            "cargo test &>/dev/tty; echo done",
+            "cargo test 2>/dev/fd/1 >/dev/null; echo done",
+        ] {
+            assert_eq!(
+                row_of_a_call(command, "rtk cargo"),
+                (0, MEASURED),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// Both stages of a pipeline wrote what came back: the producer's output, as the
+    /// consumer kept it. They share it as any two commands do.
+    #[test]
+    fn test_pipeline_stages_share_the_measured_output() {
+        let cargo_avg = category_avg_tokens("Cargo", "test");
+        let other = category_avg_tokens("", "");
+        for command in ["cargo test | foo", "cargo test | foo\necho done"] {
+            assert_eq!(
+                row_of_a_call(command, "rtk cargo"),
+                (1, MEASURED * cargo_avg / (cargo_avg + other)),
+                "{command:?}"
+            );
+        }
+        // After a pipe, `time` is the program, which the report does not size.
+        assert_eq!(
+            row_of_a_call("foo | time cargo test; git status", "rtk git").1,
+            MEASURED * 40 / (40 + 2 * other)
+        );
+        assert_eq!(
+            row_of_a_call("git status; : | time echo x", "rtk git").1,
+            MEASURED * 40 / (40 + other)
+        );
+    }
+
+    /// A command that sent both its streams elsewhere wrote nothing that came back: it
+    /// takes zero, and the command after it takes the output whole.
+    #[test]
+    fn test_a_command_that_sends_nothing_back_takes_no_share() {
+        for command in [
+            "cargo test > test.log 2>&1; tail -20 test.log",
+            "cargo test &> test.log; tail -20 test.log",
+            "cargo test &>> test.log; tail -20 test.log",
+            "cargo test >& test.log; tail -20 test.log",
+            "cargo test > test.log 2> err.log; tail -20 test.log",
+            "cargo test 2>/dev/null >/dev/null; tail -20 test.log",
+            "cargo test > /dev/null 2>&-; tail -20 test.log",
+            "cargo test > ${LOG} 2>&1; tail -20 test.log",
+            "cargo test > $(mktemp) 2>&1; tail -20 test.log",
+            "cargo test > test.log 2>& 1; tail -20 test.log",
+        ] {
+            assert_eq!(row_of_a_call(command, "rtk cargo"), (0, 0), "{command:?}");
+            assert_eq!(
+                row_of_a_call(command, "rtk read"),
+                (0, MEASURED),
+                "{command:?}"
+            );
+        }
+        // Without a measurement it still wrote nothing that came back, an estimate with
+        // nothing to check it against. Beside other writers of a measurement it is known.
+        let tally = tally_of(&["cargo test > test.log 2>&1"], &test_ctx(false));
+        assert_eq!(tally.supported["rtk cargo"].total_raw_output_tokens, 0);
+        assert_eq!(tally.supported["rtk cargo"].estimated_occurrences, 1);
+        assert_eq!(
+            row_of_a_call("git log > l.txt 2>&1; cargo test; foo", "rtk git"),
+            (0, 0)
+        );
+
+        // A text holding several commands sends nothing back only if none of them does.
+        for opaque in [
+            "cargo fmt >/dev/null 2>&1; git commit -F - <<'EOF'\nmsg\nEOF",
+            "cargo fmt >/dev/null 2>&1\ngit status\n: $((n + 1))",
+        ] {
+            assert_eq!(
+                row_of_a_call(opaque, "rtk cargo"),
+                (0, MEASURED),
+                "{opaque:?}"
+            );
+        }
+        for opaque in [
+            "cargo fmt >/dev/null 2>&1; : $((n + 1)) &>/dev/null",
+            "cargo fmt >/dev/null 2>&1; : $((n + 1)) &>/dev/null;",
+            "cargo fmt >/dev/null 2>&1 &\n: $((n + 1)) &>/dev/null",
+        ] {
+            assert_eq!(row_of_a_call(opaque, "rtk cargo"), (0, 0), "{opaque:?}");
+        }
+        let opaque = "cargo fmt; : $((n + 1)) &>/dev/null";
+        assert_eq!(row_of_a_call(opaque, "rtk cargo"), (0, MEASURED));
+        let opaque = "cargo fmt >/dev/null 2>&1 & git log -n $((n + 1))";
+        assert_eq!(row_of_a_call(opaque, "rtk cargo"), (0, MEASURED));
+
+        // One stream still coming back keeps the share.
+        for command in [
+            "cargo test > test.log; tail -20 test.log",
+            "cargo test 2>&1 > test.log; tail -20 test.log",
+            "cargo test 2> err.log; tail -20 test.log",
+            "cargo test >&2 2>/dev/null; tail -20 test.log",
+            "cargo test < input.txt 2> err.log; tail -20 test.log",
+            // A process may print what it is sent back, and `>& 2` copies a stream.
+            "cargo test > >(tee test.log) 2>&1; tail -20 test.log",
+            "cargo build > b.log 2> >(tee err.log >&2); tail -20 test.log",
+            "cargo test >& 2 2>/dev/null; tail -20 test.log",
+            "cargo test 2>& 1 > test.log; tail -20 test.log",
+            "cargo test >&$FD; tail -20 test.log",
+        ] {
+            let (estimated, tokens) = row_of_a_call(command, "rtk cargo");
+            assert_eq!(estimated, 1, "{command:?}");
+            assert!(tokens > 0 && tokens < MEASURED, "{command:?}: {tokens}");
+        }
+    }
+
+    /// Without a measurement, a command is sized by its own category average, read past
+    /// the assignments in front of it as its share would be.
+    #[test]
+    fn test_an_unmeasured_command_is_sized_past_its_assignments() {
+        let tally = tally_of(&["FOO=1 cargo test"], &test_ctx(false));
+        assert_eq!(
+            tally.supported["rtk cargo"].total_raw_output_tokens,
+            category_avg_tokens("Cargo", "test")
+        );
+    }
+
+    /// A share too small to round above nothing is still an estimate.
+    #[test]
+    fn test_a_share_rounded_to_nothing_stays_an_estimate() {
+        let mut tally = Tally::default();
+        tally.add(
+            &scanned("git status; cargo test", Some(12)),
+            &test_ctx(false),
+        );
+        assert_eq!(tally.supported["rtk git"].estimated_occurrences, 1);
+    }
+
+    /// Commands that wrote to the output share it by their averages, and add up to it.
+    #[test]
+    fn test_writers_share_the_measured_output_by_their_averages() {
+        let cargo_avg = category_avg_tokens("Cargo", "test");
+        let git_avg = category_avg_tokens("Git", "status");
+        let total = cargo_avg + git_avg;
+        for command in ["cargo test\ngit status", "cargo test; git status"] {
+            let (cargo_estimated, cargo) = row_of_a_call(command, "rtk cargo");
+            let (git_estimated, git) = row_of_a_call(command, "rtk git");
+            assert_eq!((cargo_estimated, git_estimated), (1, 1), "{command:?}");
+            assert_eq!(cargo, MEASURED * cargo_avg / total, "{command:?}");
+            assert_eq!(git, MEASURED * git_avg / total, "{command:?}");
+        }
+        // The prefix is no word of the command, so `test` is still what sizes it.
+        assert_eq!(
+            row_of_a_call("RTK_DISABLED=1 cargo test\ngit status", "rtk git").1,
+            MEASURED * git_avg / total
+        );
+    }
+
+    /// A command with no row, or already through rtk, may have written it all.
+    #[test]
+    fn test_a_command_with_no_row_keeps_its_share() {
+        let other = category_avg_tokens("", "");
+        let git_avg = category_avg_tokens("Git", "status");
+        for command in [
+            "git status && ./build.sh",
+            "git status\nrtk cargo test",
+            "git status\nrtk bypass cargo test",
+            "git status\nbash ./build.sh",
+            "git status; sed -n 1,9p big.log",
+            "git status\npython3 -c 'print(1)'",
+            "git status; $(pwd)/run_tests.sh",
+            "git status; `pwd`/build.sh",
+        ] {
+            assert_eq!(
+                row_of_a_call(command, "rtk git"),
+                (1, MEASURED * git_avg / (git_avg + other)),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// Every line of a multi-line call is a command the agent ran.
+    #[test]
+    fn test_the_report_counts_every_line_of_a_call() {
+        let tally = tally_of(
+            &[
+                "git status\ncargo test",
+                "cd x\ngit log",
+                "foo bar\ngit diff",
+            ],
+            &test_ctx(false),
+        );
+
+        assert_eq!(tally.total_commands, 6);
+        assert_eq!(counts(&tally.supported), [("rtk cargo", 1), ("rtk git", 3)]);
+
+        // One too complex to join is refused by the rewrite, and stays one text here.
+        let tally = tally_of(&["git status\na[1 # 2]=b\ngit log"], &test_ctx(false));
+        assert_eq!(tally.total_commands, 1);
+    }
+
     /// A `\⏎` is no word: the report reads a line as the hook does.
     #[test]
     fn test_the_report_reads_a_line_with_its_continuations_joined() {
@@ -1040,10 +1565,41 @@ mod tests {
 
         assert_eq!(tally.total_commands, 2);
         assert_eq!(counts(&tally.supported), vec![("rtk cargo", 1)]);
-        assert!(
-            tally.opportunities.is_empty(),
-            "`tail` wrote what came back; counting it would bill the line twice"
-        );
+        assert!(tally.opportunities.is_empty());
+    }
+
+    /// A consumer the rewriter does not take is kept raw whatever stands in front of it,
+    /// whether its rule never runs at the end of a pipeline or this form of it is unsafe
+    /// there (`grep -f`).
+    #[test]
+    fn test_a_consumer_the_rewriter_never_takes_is_in_neither_table() {
+        for command in [
+            "foo | tail -1",
+            "make 2>&1 | head -20",
+            "cargo test 2>&1 | sort | tail -5",
+            "rtk cargo test 2>&1 | tail -1",
+        ] {
+            let tally = tally_of(&[command], &test_ctx(false));
+            assert!(!tally.opportunities.contains_key("rtk read"), "{command:?}");
+        }
+        for command in ["foo | git log", "foo | grep -f patterns.txt"] {
+            let tally = tally_of(&[command], &test_ctx(false));
+            assert!(tally.opportunities.is_empty(), "{command:?}");
+            assert!(tally.supported.is_empty(), "{command:?}");
+        }
+
+        // Only a pipe makes a consumer: after `;` the command stands on its own.
+        let tally = tally_of(&["git status; tail -f app.log"], &test_ctx(false));
+        assert_eq!(counts(&tally.opportunities), vec![("rtk read", 1)]);
+    }
+
+    /// The other way round, a producer left in front of a consumer the rewriter
+    /// takes is an opportunity: rewriting it is the change to make.
+    #[test]
+    fn test_a_producer_left_in_front_of_a_rewritten_consumer_is_an_opportunity() {
+        let tally = tally_of(&["cargo test | grep FAILED"], &test_ctx(false));
+
+        assert_eq!(counts(&tally.opportunities), vec![("rtk cargo", 1)]);
     }
 
     /// With a hook installed and nothing in the log, the estimate carries the
@@ -1064,10 +1620,10 @@ mod tests {
         assert!(tally.supported.is_empty());
     }
 
-    /// A line's measured output was written by its last command. Handing it to
-    /// every part multiplies the estimate by the number of parts.
+    /// A line's measured output is shared by the commands that wrote it. Handing
+    /// it to every part multiplies the estimate by the number of parts.
     #[test]
-    fn test_measured_output_is_credited_to_the_command_that_wrote_it() {
+    fn test_measured_output_is_shared_by_the_commands_that_wrote_it() {
         let ctx = test_ctx(false);
         let mut tally = Tally::default();
         tally.add(&scanned("cargo test | grep FAILED", Some(40_000)), &ctx);
@@ -1077,15 +1633,14 @@ mod tests {
             .opportunities
             .get("rtk cargo")
             .expect("cargo is reported");
-        assert_eq!(
-            grep.total_raw_output_tokens,
-            40_000 / 4,
-            "the last command gets the measured size"
+        let shared = grep.total_raw_output_tokens + cargo.total_raw_output_tokens;
+        assert!(
+            (40_000 / 4 - 1..=40_000 / 4).contains(&shared),
+            "the shares add up to the measured size: {shared}"
         );
-        assert_ne!(
-            cargo.total_raw_output_tokens,
-            40_000 / 4,
-            "an earlier command falls back to the category average"
+        assert_eq!(
+            (grep.estimated_occurrences, cargo.estimated_occurrences),
+            (1, 1)
         );
     }
 
@@ -1293,6 +1848,10 @@ mod tests {
             judge("RTK_DISABLED=1 env -i git status", &ctx),
             unbypassed("env -i git status")
         );
+        // Its row is the line without the assignment, not the line as typed.
+        let tally = tally_of(&["sudo RTK_DISABLED=1 docker ps"], &ctx);
+        let rows: Vec<&String> = tally.unsupported.keys().collect();
+        assert_eq!(rows, vec!["sudo docker"]);
         // A wrapper's script too complex to read rewrites nothing of the line.
         let line = "git status; bash -c 'a[1 # 2]=b'";
         assert!(!estimate_hook_coverage_with_verdict(

@@ -18,10 +18,10 @@ use crate::core::arg_tokenizer::{self, TokenKind as ArgKind};
 use crate::core::cmdline::bash_grammar::{ReservedWord, reserved_word};
 use crate::core::cmdline::edit::{Edit, apply_edits};
 use crate::core::cmdline::lexer::{
-    CommandStart, PipeKind, QuoteScan, Reading, SubstitutionDepth, Token, TokenKind, Word,
-    ansi_c_quote_defeats_lexer, assignment_value, contains_unattestable_construct_in,
-    content_bounds, function_definition_closer, is_ifs, join_continuations, read_grammar,
-    redirect_has_file_target, redirect_takes_operand, resolve_words, shell_split,
+    CommandStart, JoinedLine, PipeKind, QuoteScan, Reading, SubstitutionDepth, Token, TokenKind,
+    Word, ansi_c_quote_defeats_lexer, assignment_value, contains_unattestable_construct_in,
+    content_bounds, function_definition_closer, is_heredoc_operator, is_ifs, join_continuations,
+    read_grammar, redirect_has_file_target, redirect_takes_operand, resolve_words, shell_split,
     split_for_classify, split_for_permissions, split_ifs, squeeze_blanks, starts_with_grammar,
     tokenize, tokenize_at, tokenize_trimmed, trim_ifs, trim_ifs_end, trim_ifs_start,
     without_comments, words,
@@ -45,7 +45,8 @@ pub enum Classification {
     Ignored,
 }
 
-/// Average token counts per category for estimation when no output_len available.
+/// Average token counts per category: a command's size when its call has no measured
+/// output, and its weight when it shares one with other commands.
 pub fn category_avg_tokens(category: &str, subcmd: &str) -> usize {
     match category {
         "Git" => match subcmd {
@@ -378,7 +379,7 @@ pub fn has_heredoc(cmd: &str) -> bool {
 fn tokens_have_heredoc(tokens: &[Token<'_>]) -> bool {
     tokens
         .iter()
-        .any(|t| t.kind == TokenKind::Redirect && t.value.starts_with("<<"))
+        .any(|t| t.kind == TokenKind::Redirect && is_heredoc_operator(t.value))
 }
 
 /// One command in a chain, with what a report needs to know about where it sat.
@@ -389,42 +390,62 @@ pub struct ChainPart<'a> {
     pub feeds_pipe: bool,
 }
 
-pub fn split_command_chain_parts(cmd: &str) -> Vec<ChainPart<'_>> {
+/// The commands of `line`, read as the hook reads it. A block that could not be joined is
+/// not read line by line, as the rewrite refuses it.
+pub(crate) fn split_command_chain_parts<'a>(line: &'a JoinedLine<'_>) -> Vec<ChainPart<'a>> {
+    split_line(&line.text, line.joined)
+}
+
+/// The text of each of [`split_command_chain_parts`]'s commands for `cmd`.
+#[cfg(test)]
+pub(crate) fn split_command_chain(cmd: &str) -> Vec<String> {
+    split_command_chain_parts(&JoinedLine::of(cmd))
+        .into_iter()
+        .map(|p| p.text.to_string())
+        .collect()
+}
+
+fn split_line(cmd: &str, joined: bool) -> Vec<ChainPart<'_>> {
     let trimmed = trim_ifs(cmd);
     if trimmed.is_empty() {
         return vec![];
     }
-
-    // Lexer-based for `<<`; string-based for `$((` (lexer splits it across tokens).
-    if has_heredoc(trimmed) || trimmed.contains("$((") {
-        return vec![ChainPart {
-            text: trimmed,
-            feeds_pipe: false,
-        }];
-    }
+    // The lines of a block, as the rewrite reads them, are commands the agent ran too. A
+    // CRLF leaves a `\r` on each line's last word, and the rewrite refuses a block it
+    // cannot join, so neither is read line by line here.
+    let by_line = joined && !trimmed.contains("\r\n") && !trimmed.ends_with('\r');
 
     // Every stage, not just the one before the first `|`. A pipeline's later
     // stages are commands the agent ran, and stopping at the pipe made them
     // invisible to classification — `rtk discover` could not report what it
     // never looked at (#3683).
-    split_for_classify(trimmed)
-        .into_iter()
-        .map(|s| ChainPart {
+    let parts_of = |text| {
+        split_for_classify(text).into_iter().map(|s| ChainPart {
             text: s.text,
             feeds_pipe: s.feeds_pipe,
         })
-        .collect()
+    };
+    let block = CompoundLex::new(trimmed);
+    match read_line(&block) {
+        LineReading::Opaque => {
+            return vec![ChainPart {
+                text: trimmed,
+                feeds_pipe: false,
+            }];
+        }
+        LineReading::Block(BlockLines::Units(units)) if by_line && !units.is_empty() => {
+            return units
+                .into_iter()
+                .flat_map(|unit| parts_of(unit.as_str()))
+                .collect();
+        }
+        _ => {}
+    }
+    parts_of(trimmed).collect()
 }
 
-pub fn split_command_chain(cmd: &str) -> Vec<&str> {
-    split_command_chain_parts(cmd)
-        .into_iter()
-        .map(|p| p.text)
-        .collect()
-}
-
-/// Which commands of `full` the rewriter acts on, one flag per
-/// [`split_command_chain`] part.
+/// Which commands of `line` the rewriter acts on, one flag per
+/// [`split_command_chain_parts`] part.
 ///
 /// Put to the rewriter rather than re-derived from `PipelineSafety`, so the two
 /// cannot drift: a second copy of the rule is a second thing to keep in step.
@@ -437,19 +458,28 @@ pub fn split_command_chain(cmd: &str) -> Vec<&str> {
 /// that reads it would change what the pipeline prints. In
 /// `cargo test | grep FAILED` it is the other way round, because `rtk grep` is
 /// one of the rules that are safe to run at the end of a pipeline. A command
-/// the rewriter passes over offers nothing to save.
+/// the rewriter passes over is no missed saving: the report lists it as an
+/// opportunity, reachable only by changing the command, unless it reads a pipe:
+/// the rewriter leaves a consumer it does not take raw on purpose.
 pub(crate) fn stages_the_rewriter_reaches(
-    full: &str,
+    line: &JoinedLine<'_>,
     excluded: &[ExcludePattern],
     normalized_prefixes: &[String],
 ) -> Vec<bool> {
-    // The rewrite emits the line with its continuations joined, so read it the same.
-    let joined = join_continuations(full);
-    let before = split_command_chain(joined.as_deref().unwrap_or(full));
-    let Some(rewritten) = rewrite_command_precompiled(full, excluded, normalized_prefixes) else {
+    // The rewrite emits the line with its continuations joined, which `line` already is.
+    let before: Vec<&str> = split_command_chain_parts(line)
+        .into_iter()
+        .map(|p| p.text)
+        .collect();
+    let Some(rewritten) = rewrite_command_precompiled(&line.text, excluded, normalized_prefixes)
+    else {
         return vec![false; before.len()];
     };
-    let after = split_command_chain(&rewritten);
+    let rewritten = JoinedLine::of(&rewritten);
+    let after: Vec<&str> = split_command_chain_parts(&rewritten)
+        .into_iter()
+        .map(|p| p.text)
+        .collect();
     // A rewrite substitutes commands and keeps every separator, so the chains
     // line up command for command. If they ever do not, nothing can be located
     // and claiming a saving would be a guess.
@@ -919,15 +949,36 @@ pub(crate) fn rewrite_command_precompiled(
     // the checks below (#3188 review).
     let normalized = join_continuations(cmd).ok()?;
     let line = CompoundLex::new(&normalized);
-    if line.text.is_empty() || line.has_heredoc() || line.text.contains("$((") {
+    if line.text.is_empty() {
         return None;
     }
-
-    if line.text.contains('\n') {
-        return rewrite_multiline_block(&line, compiled, normalized_prefixes);
+    match read_line(&line) {
+        LineReading::Opaque => None,
+        LineReading::OneLine => rewrite_single(&line, compiled, normalized_prefixes),
+        LineReading::Block(lines) => {
+            rewrite_multiline_block(&line, lines, compiled, normalized_prefixes)
+        }
     }
+}
 
-    rewrite_single(&line, compiled, normalized_prefixes)
+/// How the rewrite reads a line it has joined, and the report with it, so the two read
+/// the same commands.
+enum LineReading<'a, 't> {
+    /// A heredoc or an arithmetic `$((`: read as one text, never rewritten.
+    Opaque,
+    OneLine,
+    Block(BlockLines<'a, 't>),
+}
+
+fn read_line<'a, 't>(line: &'t CompoundLex<'a>) -> LineReading<'a, 't> {
+    // Lexer-based for `<<`; string-based for `$((` (lexer splits it across tokens).
+    if line.has_heredoc() || line.text.contains("$((") {
+        LineReading::Opaque
+    } else if line.text.contains('\n') {
+        LineReading::Block(block_lines(line))
+    } else {
+        LineReading::OneLine
+    }
 }
 
 /// Whether `line` is one simple command that runs rtk: [`rtk_invocation`]
@@ -961,13 +1012,18 @@ fn rewrite_single(
         .flatten()
 }
 
-/// Unquoted `(`/`)` or `{`/`}` that don't balance within the line: an array
-/// literal (`arr=(one`), function body (`foo() {`), or group spans lines, so
-/// the lines around it are not independent commands.
+/// Unquoted `(`/`)`, `{`/`}` or backquotes that don't balance within the line: an array
+/// literal (`arr=(one`), function body (`foo() {`), group or substitution spans lines,
+/// so the lines around it are not independent commands.
 fn line_has_unbalanced_grouping(code: &str) -> bool {
     let mut paren = 0i32;
     let mut brace = 0i32;
+    let mut in_backquotes = false;
     for c in QuoteScan::new(code).significant() {
+        // A backquote opens a substitution in double quotes too.
+        if c.byte == b'`' && !c.in_single {
+            in_backquotes = !in_backquotes;
+        }
         if c.in_single || c.in_double {
             continue;
         }
@@ -982,7 +1038,7 @@ fn line_has_unbalanced_grouping(code: &str) -> bool {
             return true;
         }
     }
-    paren != 0 || brace != 0
+    paren != 0 || brace != 0 || in_backquotes
 }
 
 /// Unquoted `[[` / `]]` words that don't balance within the line: bash allows
@@ -1060,32 +1116,60 @@ fn classify_line(line: &str) -> LineRole {
     LineRole::Independent
 }
 
-/// Rewrite each line of a multi-line block independently (issue #1243).
+/// Rewrite each line of a multi-line block independently (issue #1243), as
+/// [`block_lines`] reads it. Blank lines and indentation stay as written.
 ///
-/// Split points are the newline tokens the quote-aware lexer emits, so a
-/// newline inside a quoted string (e.g. a multi-line commit message) never
-/// becomes a boundary. Lines continued by a trailing `&&`/`||`/`|`/`|&` are
-/// joined and rewritten as one logical command, the newlines and blank lines
-/// inside it kept as written; any line [`classify_line`] marks unsafe passes
-/// the whole block through. Blank lines are preserved verbatim, as is
-/// indentation. A line ends at its `\n` only: the `\r` of a CRLF is the last
-/// byte of the line's last word, as bash reads it.
-///
-/// If any newline byte was swallowed by quote state, the block passes through
-/// untouched: rewriting (or prefixing) such a block would act on lines no
-/// permission verdict was computed for. Passthrough hands the original command to
-/// the agent's native permission handling instead. Genuine quoted newlines
-/// (multi-line commit messages) also land here; forgoing that rewrite is the safe
-/// trade.
+/// If a block is refused, it passes through untouched: rewriting (or prefixing) it would
+/// act on lines no permission verdict was computed for. Passthrough hands the original
+/// command to the agent's native permission handling instead. A quoted newline beside a
+/// real one (a multi-line commit message and another line) lands here too; forgoing that
+/// rewrite is the safe trade.
 fn rewrite_multiline_block(
     block: &CompoundLex<'_>,
+    lines: BlockLines<'_, '_>,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
 ) -> Option<String> {
+    let units = match lines {
+        BlockLines::Refused => return None,
+        BlockLines::OneCommand => return rewrite_single(block, excluded, transparent_prefixes),
+        BlockLines::Units(units) => units,
+    };
+    let mut edits = Vec::new();
+    for unit in units {
+        if !already_rtk(&unit) {
+            rewrite_compound(unit, excluded, transparent_prefixes, 0, &mut edits);
+        }
+    }
+    (!edits.is_empty())
+        .then(|| apply_edits(block.text, &edits))
+        .flatten()
+}
+
+/// How a multi-line block reads, as [`rewrite_multiline_block`] acts on it and the
+/// report counts it.
+enum BlockLines<'a, 't> {
+    /// A newline in it is out of the reader's hands, or a line is not a command of its
+    /// own: nothing in it can be read line by line.
+    Refused,
+    /// Its newlines are all in quotes.
+    OneCommand,
+    /// Its commands: a line each, with the lines a trailing operator joins taken
+    /// together. A blank or comment-only line is none of them.
+    Units(Vec<Slice<'a, 't>>),
+}
+
+/// Split points are the newline tokens the quote-aware lexer emits, so a newline inside
+/// a quoted string (e.g. a multi-line commit message) never becomes a boundary. Lines
+/// continued by a trailing `&&`/`||`/`|`/`|&` are one unit, the newlines and blank lines
+/// inside it kept as written; any line [`classify_line`] marks unsafe refuses the whole
+/// block. A line ends at its `\n` only: the `\r` of a CRLF is the last byte of the line's
+/// last word, as bash reads it.
+fn block_lines<'a, 't>(block: &'t CompoundLex<'a>) -> BlockLines<'a, 't> {
     let cmd = block.text;
     let tokens = &block.tokens;
     if ansi_c_quote_defeats_lexer(cmd) {
-        return None;
+        return BlockLines::Refused;
     }
 
     let newlines: Vec<usize> = tokens
@@ -1102,10 +1186,11 @@ fn rewrite_multiline_block(
         // Every newline swallowed by quote state with quotes balanced at EOF
         // is one logical command (a multi-line commit message), not a hidden
         // extra line; rewrite it whole, as develop always did (#3319 fuzz).
-        if newlines.is_empty() && quotes_balanced(cmd) {
-            return rewrite_single(block, excluded, transparent_prefixes);
-        }
-        return None;
+        return if newlines.is_empty() && quotes_balanced(cmd) {
+            BlockLines::OneCommand
+        } else {
+            BlockLines::Refused
+        };
     }
 
     // Each line is the run of tokens between the newlines around it.
@@ -1127,10 +1212,10 @@ fn rewrite_multiline_block(
         .map(|line| classify_line(trim_ifs(line_text(line))))
         .collect();
     if roles.contains(&LineRole::Unsafe) {
-        return None;
+        return BlockLines::Refused;
     }
 
-    let mut edits = Vec::new();
+    let mut units = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         if roles[i] == LineRole::Passive {
@@ -1150,22 +1235,15 @@ fn rewrite_multiline_block(
             if roles[next] == LineRole::Passive {
                 // Comment line inside a continuation: joined textually, the comment
                 // would take in the lines after it (#3188 review).
-                return None;
+                return BlockLines::Refused;
             }
             end = next;
         }
 
-        if let Some(unit) = Slice::new(cmd, &tokens[lines[i].start..lines[end].end])
-            && !already_rtk(&unit)
-        {
-            rewrite_compound(unit, excluded, transparent_prefixes, 0, &mut edits);
-        }
+        units.extend(Slice::new(cmd, &tokens[lines[i].start..lines[end].end]));
         i = end + 1;
     }
-
-    (!edits.is_empty())
-        .then(|| apply_edits(cmd, &edits))
-        .flatten()
+    BlockLines::Units(units)
 }
 
 /// Where a pipeline's stages are, as indices into its line's tokens.
@@ -2945,6 +3023,11 @@ mod tests {
     use crate::core::cmdline::lexer::shell_split;
     use crate::core::test_isolation;
 
+    /// [`stages_the_rewriter_reaches`] for `cmd` read as the report reads a call.
+    fn reaches(cmd: &str) -> Vec<bool> {
+        stages_the_rewriter_reaches(&JoinedLine::of(cmd), &[], &[])
+    }
+
     fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
         super::rewrite_command(cmd, excluded, &[])
     }
@@ -3248,7 +3331,7 @@ mod tests {
         fn no_supported_piece_inside_expressions_and_patterns() {
             use super::super::{Classification, classify_command};
 
-            fn supported(cmd: &str) -> Vec<&str> {
+            fn supported(cmd: &str) -> Vec<String> {
                 split_command_chain(cmd)
                     .into_iter()
                     .filter(|part| {
@@ -4140,6 +4223,61 @@ mod tests {
     }
 
     #[test]
+    fn test_chain_parts_read_the_lines_of_a_block_as_the_rewrite_does() {
+        for (cmd, parts) in [
+            ("a; b\nc | d", vec!["a", "b", "c", "d"]),
+            ("a\n\nb", vec!["a", "b"]),
+            ("a # c\nb", vec!["a # c", "b"]),
+            ("# only\na", vec!["a"]),
+            ("a &&\n\nb", vec!["a", "b"]),
+            ("a 'b\nc'", vec!["a 'b\nc'"]),
+            ("[[ a && b ]]\nfoo", vec!["[[ a && b ]]", "foo"]),
+            ("printf 'a\rb'\nfoo", vec!["printf 'a\rb'", "foo"]),
+            // Not line by line: what the rewrite refuses stays read as one text.
+            ("if a\nthen\nb\nfi", vec!["if a\nthen\nb\nfi"]),
+            ("a[1 # 2]=b\nfoo", vec!["a[1 # 2]=b\nfoo"]),
+            ("a\r\n\r\nb\r\n", vec!["a\r\n\r\nb\r"]),
+            ("a\nb\r\n", vec!["a\nb\r"]),
+            ("a\r\nb", vec!["a\r\nb"]),
+            ("echo `date`\nfoo", vec!["echo `date`", "foo"]),
+            ("echo \"`a\"\nb\n\"`\"", vec!["echo \"`a\"\nb\n\"`\""]),
+            ("# a\n# b", vec!["# a\n# b"]),
+        ] {
+            assert_eq!(split_command_chain(cmd), parts, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_line_left_inside_a_backquote_refuses_its_block() {
+        assert_eq!(
+            rewrite_command_no_prefixes("echo `\ngit status\n`\ngit log", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log `a\nb`\ngit status", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_a_block_the_rewrite_splits_lines_up_with_its_rewrite() {
+        assert_eq!(
+            reaches("ls -la\r\nfoo bar\r\n"),
+            [true],
+            "a CRLF block stays one text on both sides"
+        );
+        assert_eq!(
+            reaches("git status\nfoo bar\r\n"),
+            [true],
+            "and so does one whose only CRLF is its last"
+        );
+        assert_eq!(
+            reaches("git status\nfoo bar\n# c\ngit log"),
+            [true, false, true]
+        );
+    }
+
+    #[test]
     fn test_classify_cd_ignored() {
         assert_eq!(classify_command("cd /tmp"), Classification::Ignored);
     }
@@ -4428,7 +4566,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                stages_the_rewriter_reaches(cmd, &[], &[]),
+                reaches(cmd),
                 expected,
                 "{cmd:?} rewrites to {:?}",
                 rewrite_command_no_prefixes(cmd, &[])
@@ -4447,8 +4585,9 @@ mod tests {
             ("a || b", vec![false, false]),
             ("a", vec![false]),
             ("cat <<EOF | wc -l", vec![false]),
+            ("a |\nb\nc", vec![true, false, false]),
         ] {
-            let feeds: Vec<bool> = split_command_chain_parts(cmd)
+            let feeds: Vec<bool> = split_command_chain_parts(&JoinedLine::of(cmd))
                 .iter()
                 .map(|p| p.feeds_pipe)
                 .collect();
@@ -4468,7 +4607,7 @@ mod tests {
             "git status",
         ] {
             assert_eq!(
-                stages_the_rewriter_reaches(cmd, &[], &[]).len(),
+                reaches(cmd).len(),
                 split_command_chain(cmd).len(),
                 "flag count does not match part count for {cmd:?}"
             );
@@ -4506,7 +4645,7 @@ mod tests {
     #[test]
     fn test_a_bypass_does_not_stop_a_sibling_clause() {
         assert_eq!(
-            stages_the_rewriter_reaches("RTK_DISABLED=1 cargo test && git status", &[], &[]),
+            reaches("RTK_DISABLED=1 cargo test && git status"),
             vec![false, true]
         );
     }
@@ -4527,6 +4666,9 @@ mod tests {
     #[test]
     fn test_split_heredoc_no_split() {
         let cmd = "cat <<'EOF'\nhello && world\nEOF";
+        assert_eq!(split_command_chain(cmd), vec![cmd]);
+        // With an fd number in front, its body is no command either.
+        let cmd = "cat 0<<EOF\ngit push --force\ngit log\nEOF";
         assert_eq!(split_command_chain(cmd), vec![cmd]);
     }
 

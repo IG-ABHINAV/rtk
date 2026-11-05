@@ -32,6 +32,7 @@ The command under the layers is then decided on. Its trailing redirects (`2>&1`,
 Each decision is one edit against the line (`core/cmdline/edit.rs`): one renames the decided command's span, and another puts `rtk ` in front of it. Every other byte is kept as written, so the layers, the redirects, the operators and the blanks between them come out as the author wrote them.
 
 **Guards along the way:**
+- Heredoc or here-string (`<<`, `<<-`, `<<<`) or `$((` anywhere in the command → the whole command stays raw, every segment included (`read_line`, checked before splitting; the report reads it as one command too)
 - `RTK_DISABLED=1` in the env prefix → skip rewrite (under a routable wrapper such as `uv run`, the wrapper itself is still rewritten: `uv run RTK_DISABLED=1 git status` becomes `rtk uv run RTK_DISABLED=1 git status`)
 - `gh` with `--json`/`--jq`/`--template` → skip (structured output, rtk would corrupt it)
 - `cat` with flags other than `-n` → skip (different semantics than `rtk read`)
@@ -49,7 +50,7 @@ Command segmentation, word splitting and quote scanning live in `core/cmdline/le
 `rtk discover` reads Claude Code JSONL session files. Each file contains `tool_use`/`tool_result` pairs for every command the LLM ran. The module:
 
 1. Extracts commands from the JSONL (via `SessionProvider` trait — currently only Claude Code)
-2. Splits compound commands where the rewrite does: both read the line through `read_grammar`, so a `[[ ]]` expression, an arithmetic command and a `case` pattern hold no command of their own
+2. Splits compound commands where the rewrite does: both read the line through `read_grammar`, so a `[[ ]]` expression, an arithmetic command and a `case` pattern hold no command of their own. A multi-line call is read line by line as the rewrite reads it, and one it refuses to read that way stays one text.
 3. Classifies each command against the same rules used for live rewriting
 4. Aggregates results: which commands could have been rewritten, estimated token savings, adoption rate
 
